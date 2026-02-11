@@ -6,6 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { useTranslation } from 'react-i18next';
 import { IS_PLATFORM } from '../constants/config';
+import TerminalButtonBar from './TerminalButtonBar';
 
 const xtermStyles = `
   .xterm .xterm-screen {
@@ -64,6 +65,7 @@ function Shell({ selectedProject, selectedSession, initialCommand, isPlainShell 
   const [isConnecting, setIsConnecting] = useState(false);
   const [authUrl, setAuthUrl] = useState('');
   const [authUrlCopyStatus, setAuthUrlCopyStatus] = useState('idle');
+  const manualDisconnectRef = useRef(false);
 
   const selectedProjectRef = useRef(selectedProject);
   const selectedSessionRef = useRef(selectedSession);
@@ -225,11 +227,14 @@ function Shell({ selectedProject, selectedSession, initialCommand, isPlainShell 
 
   const connectToShell = useCallback(() => {
     if (!isInitialized || isConnected || isConnecting) return;
+    manualDisconnectRef.current = false;
     setIsConnecting(true);
     connectWebSocket();
   }, [isInitialized, isConnected, isConnecting, connectWebSocket]);
 
   const disconnectFromShell = useCallback(() => {
+    manualDisconnectRef.current = true;
+
     if (ws.current) {
       ws.current.close();
       ws.current = null;
@@ -476,7 +481,7 @@ function Shell({ selectedProject, selectedSession, initialCommand, isPlainShell 
   }, [selectedProject?.path || selectedProject?.fullPath, isRestarting, minimal, copyAuthUrlToClipboard]);
 
   useEffect(() => {
-    if (!autoConnect || !isInitialized || isConnecting || isConnected) return;
+    if (!autoConnect || !isInitialized || isConnecting || isConnected || manualDisconnectRef.current) return;
     connectToShell();
   }, [autoConnect, isInitialized, isConnecting, isConnected, connectToShell]);
 
@@ -643,6 +648,7 @@ function Shell({ selectedProject, selectedSession, initialCommand, isPlainShell 
           </div>
         )}
       </div>
+      <TerminalButtonBar ws={ws} isConnected={isConnected} />
     </div>
   );
 }
