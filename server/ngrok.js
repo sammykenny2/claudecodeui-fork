@@ -5,6 +5,7 @@ import ngrok from '@ngrok/ngrok';
 
 const PORT = process.env.PORT || 3001;
 const authtoken = process.env.NGROK_AUTHTOKEN;
+const domain = process.env.NGROK_DOMAIN;
 
 if (!authtoken || authtoken === 'your_authtoken_here') {
   console.error('Error: NGROK_AUTHTOKEN is not set.');
@@ -18,7 +19,8 @@ let listener;
 async function start() {
   listener = await ngrok.forward({
     addr: parseInt(PORT, 10),
-    authtoken
+    authtoken,
+    ...(domain && { domain })
   });
 
   console.log(`ngrok tunnel established: ${listener.url()} -> localhost:${PORT}`);
