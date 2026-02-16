@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Setup Claude Code UI with ngrok tunnel for auto-start on Windows boot
 
@@ -420,7 +420,7 @@ Add-Content -Path `$logFile -Value "=== [`$timestamp] Starting Claude Code UI ==
 
 # Start Express server in background
 Add-Content -Path `$logFile -Value "Starting server (npm run server)..."
-`$serverJob = Start-Process -FilePath "npm" -ArgumentList "run", "server" ``
+`$serverJob = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "npm run server" ``
     -WorkingDirectory `$repoRoot ``
     -WindowStyle Hidden ``
     -RedirectStandardOutput "`$logFile.server.out" ``
@@ -434,7 +434,7 @@ Start-Sleep -Seconds 5
 
 # Start ngrok tunnel in background
 Add-Content -Path `$logFile -Value "Starting ngrok tunnel (npm run ngrok)..."
-`$ngrokJob = Start-Process -FilePath "npm" -ArgumentList "run", "ngrok" ``
+`$ngrokJob = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "npm run ngrok" ``
     -WorkingDirectory `$repoRoot ``
     -WindowStyle Hidden ``
     -RedirectStandardOutput "`$logFile.ngrok.out" ``
