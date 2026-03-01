@@ -1272,13 +1272,16 @@ function handleShellConnection(ws) {
                     const termRows = data.rows || 24;
                     console.log('📐 Using terminal dimensions:', termCols, 'x', termRows);
 
+                    // Strip CLAUDECODE env var so the child process doesn't think
+                    // it's nested inside another Claude Code session.
+                    const { CLAUDECODE, ...cleanEnv } = process.env;
                     shellProcess = pty.spawn(shell, shellArgs, {
                         name: 'xterm-256color',
                         cols: termCols,
                         rows: termRows,
                         cwd: os.homedir(),
                         env: {
-                            ...process.env,
+                            ...cleanEnv,
                             TERM: 'xterm-256color',
                             COLORTERM: 'truecolor',
                             FORCE_COLOR: '3'

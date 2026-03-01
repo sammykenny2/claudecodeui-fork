@@ -31,6 +31,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "start": "npm run build && npm run server",
+    "ngrok": "node server/ngrok.js",
+    "dev:ngrok": "concurrently --kill-others \"npm run server\" \"npm run client\" \"npm run ngrok\"",
     "release": "./release.sh",
     "prepublishOnly": "npm run build",
     "postinstall": "node scripts/fix-node-pty.js"
@@ -55,6 +57,7 @@
     "@codemirror/merge": "^6.11.1",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@iarna/toml": "^2.2.5",
+    "@ngrok/ngrok": "^1.7.0",
     "@octokit/rest": "^22.0.0",
     "@openai/codex-sdk": "^0.101.0",
     "@replit/codemirror-minimap": "^0.5.2",
