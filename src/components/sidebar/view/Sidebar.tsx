@@ -269,6 +269,7 @@ function Sidebar({
             onShowVersionModal={() => setShowVersionModal(true)}
             onShowSettings={onShowSettings}
             projectListProps={projectListProps}
+            onProjectDelete={onProjectDelete}
             t={t}
           />
         </>

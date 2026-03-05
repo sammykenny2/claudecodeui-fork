@@ -1,9 +1,11 @@
 import { type ReactNode } from 'react';
-import { Folder, MessageSquare, Search } from 'lucide-react';
+import { Folder, MessageSquare, Search, Trash2 } from 'lucide-react';
 import type { TFunction } from 'i18next';
-import { ScrollArea } from '../../../../shared/view/ui';
+import { Button, ScrollArea } from '../../../../shared/view/ui';
 import type { Project } from '../../../../types/app';
 import type { ReleaseInfo } from '../../../../types/sharedTypes';
+import { useDeleteAllProjects } from '../../hooks/useDeleteAllProjects';
+import DeleteAllProjectsModal from './DeleteAllProjectsModal';
 import SidebarFooter from './SidebarFooter';
 import SidebarHeader from './SidebarHeader';
 import SidebarProjectList, { type SidebarProjectListProps } from './SidebarProjectList';
@@ -59,6 +61,7 @@ type SidebarContentProps = {
   onShowVersionModal: () => void;
   onShowSettings: () => void;
   projectListProps: SidebarProjectListProps;
+  onProjectDelete?: (projectName: string) => void;
   t: TFunction;
 };
 
@@ -86,10 +89,19 @@ export default function SidebarContent({
   onShowVersionModal,
   onShowSettings,
   projectListProps,
+  onProjectDelete,
   t,
 }: SidebarContentProps) {
   const showConversationSearch = searchMode === 'conversations' && searchFilter.trim().length >= 2;
   const hasPartialResults = conversationResults && conversationResults.results.length > 0;
+
+  const {
+    showDeleteAllConfirmation,
+    isDeletingAll,
+    requestDeleteAll,
+    cancelDeleteAll,
+    confirmDeleteAll,
+  } = useDeleteAllProjects(projects, onProjectDelete);
 
   return (
     <div
@@ -112,6 +124,20 @@ export default function SidebarContent({
         onCollapseSidebar={onCollapseSidebar}
         t={t}
       />
+
+      {projects.length > 0 && !isLoading && (
+        <div className="flex-shrink-0 px-3 md:px-2 pb-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="w-full h-7 text-xs text-muted-foreground hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/15 dark:hover:text-red-400 rounded-lg justify-start gap-1.5 px-2.5"
+            onClick={requestDeleteAll}
+          >
+            <Trash2 className="w-3 h-3" />
+            Delete All Projects
+          </Button>
+        </div>
+      )}
 
       <ScrollArea className="flex-1 overflow-y-auto overscroll-contain md:px-1.5 md:py-2">
         {showConversationSearch ? (
@@ -221,6 +247,15 @@ export default function SidebarContent({
         onShowSettings={onShowSettings}
         t={t}
       />
+
+      {showDeleteAllConfirmation && (
+        <DeleteAllProjectsModal
+          projectCount={projects.length}
+          isDeleting={isDeletingAll}
+          onCancel={cancelDeleteAll}
+          onConfirm={() => { void confirmDeleteAll(); }}
+        />
+      )}
     </div>
   );
 }
