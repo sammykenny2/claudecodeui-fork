@@ -133,6 +133,123 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "   - 已登入 Tailscale 網路 ✓" -ForegroundColor Green
 
+# === Funnel 狀態偵測 ===
+#
+# Tailscale 的 serve 設定是以 DNS 名稱為 key 的，機器改名後舊名的條目會留在設定裡卻不再服務
+# 任何流量，而 `tailscale funnel status` 會把它們一併印出來。用純文字比對 "localhost:<port>"
+# 或抓第一個 https://*.ts.net 因此會撈到早就失效的殘留條目——誤判成「已在運行」而跳過設置、
+# 顯示一個連不上的公網 URL，或把別筆設定的 HTTPS port 當成自己的（-Remove 就是這樣關錯對象
+# 而失敗的）。底下的判斷一律針對「目前的 DNS 名稱」查 serve 設定。
+
+# 本機目前在 Tailscale 上的 DNS 名稱（不含結尾的點）。--peers=false 讓 JSON 只含本機。
+function Get-TailscaleDnsName {
+    $raw = tailscale status --peers=false --json 2>$null
+    if (-not $raw) { return $null }
+    try {
+        $json = $raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+    if (-not $json.Self.DNSName) { return $null }
+    return $json.Self.DNSName.TrimEnd('.')
+}
+
+function Get-TailscaleServeConfig {
+    $raw = tailscale serve status --json 2>$null
+    if (-not $raw) { return $null }
+    try {
+        return $raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+# 目前 DNS 名稱 + 指定 HTTPS port 底下，/ 是否已轉發到指定的 localhost port。
+# 只認對外公開的 Funnel（AllowFunnel），僅限 tailnet 的 serve 不算。
+function Test-TailscaleFunnel {
+    param(
+        [string]$DnsName,
+        [string]$HttpsPort = "443",
+        [string]$LocalPort
+    )
+
+    if (-not $DnsName) { return $false }
+
+    $serve = Get-TailscaleServeConfig
+    if (-not $serve) { return $false }
+
+    $key = "${DnsName}:$HttpsPort"
+    if (-not $serve.AllowFunnel.$key) { return $false }
+
+    return ($serve.Web.$key.Handlers.'/'.Proxy -eq "http://localhost:$LocalPort")
+}
+
+# 對外網址；443 不會出現在 URL 裡
+function Get-TailscaleFunnelUrl {
+    param(
+        [string]$DnsName,
+        [string]$HttpsPort = "443"
+    )
+
+    if (-not $DnsName) { return $null }
+    if ($HttpsPort -eq "443") { return "https://$DnsName" }
+    return "https://${DnsName}:$HttpsPort"
+}
+
+# 目前 DNS 名稱底下、已轉發到指定 localhost port 的所有 HTTPS port
+function Get-TailscaleFunnelPortsForTarget {
+    param(
+        [string]$DnsName,
+        [string]$LocalPort
+    )
+
+    $ports = @()
+    if (-not $DnsName) { return $ports }
+
+    $serve = Get-TailscaleServeConfig
+    if (-not $serve -or -not $serve.Web) { return $ports }
+
+    foreach ($entry in $serve.Web.PSObject.Properties) {
+        if (-not $entry.Name.StartsWith("${DnsName}:")) { continue }
+        if ($entry.Value.Handlers.'/'.Proxy -ne "http://localhost:$LocalPort") { continue }
+        $ports += $entry.Name.Substring($DnsName.Length + 1)
+    }
+
+    return $ports
+}
+
+# 掛在「舊 DNS 名稱」底下、指向指定 localhost port 的殘留設定。
+# 機器改名後就會留下這種條目：它不再服務任何流量，而 `tailscale funnel ... off` 只作用在目前
+# 的名稱上，所以清不掉——唯一的辦法是 `tailscale serve reset` 整組清除後把要保留的重建回去。
+function Get-TailscaleStaleFunnelKeys {
+    param(
+        [string]$DnsName,
+        [string]$LocalPort
+    )
+
+    $stale = @()
+    if (-not $DnsName) { return $stale }
+
+    $serve = Get-TailscaleServeConfig
+    if (-not $serve -or -not $serve.Web) { return $stale }
+
+    foreach ($entry in $serve.Web.PSObject.Properties) {
+        if ($entry.Name.StartsWith("${DnsName}:")) { continue }
+        if ($entry.Value.Handlers.'/'.Proxy -eq "http://localhost:$LocalPort") {
+            $stale += $entry.Name
+        }
+    }
+
+    return $stale
+}
+
+$tsDnsName = Get-TailscaleDnsName
+if ($tsDnsName) {
+    Write-Host "   - DNS 名稱：$tsDnsName" -ForegroundColor Gray
+} else {
+    Write-Host "   - 無法取得 Tailscale DNS 名稱，Funnel 狀態偵測可能不準確" -ForegroundColor Yellow
+}
+
 # === 驗證操作 ===
 if ($Verify) {
     Write-Host "`n=== 開始驗證服務 ===" -ForegroundColor Cyan
@@ -182,22 +299,21 @@ if ($Verify) {
 
     # 檢查 Tailscale Funnel 狀態
     Write-Host "`n4. 檢查 Tailscale Funnel 狀態..." -ForegroundColor Yellow
-    $funnelStatus = tailscale funnel status 2>$null
-    $funnelCheck = $funnelStatus | Select-String "localhost:$port"
-    if ($funnelCheck) {
+    $expectedHttpsPort = if ($tsHttpsPort) { $tsHttpsPort } else { "443" }
+    if (Test-TailscaleFunnel -DnsName $tsDnsName -HttpsPort $expectedHttpsPort -LocalPort $port) {
         Write-Host "   - Tailscale Funnel 運行中 ✓" -ForegroundColor Green
-
-        # 提取訪問 URL
-        $funnelUrl = $funnelStatus | Where-Object { $_ -notmatch '^\s*#' } | Select-String "https://.*\.ts\.net" | Select-Object -First 1
-        if ($funnelUrl) {
-            if ($funnelUrl.Line -match '(https://\S+)') {
-                Write-Host "   - 公網 URL：$($Matches[1])" -ForegroundColor Green
-            }
-        }
+        Write-Host "   - 公網 URL：$(Get-TailscaleFunnelUrl -DnsName $tsDnsName -HttpsPort $expectedHttpsPort)" -ForegroundColor Green
     } else {
         Write-Host "   - Tailscale Funnel 未運行" -ForegroundColor Red
-        Write-Host "   - 手動啟動：tailscale funnel --bg http://localhost:$port" -ForegroundColor Yellow
+        Write-Host "   - 手動啟動：tailscale funnel --bg $tsHttpsArg http://localhost:$port" -ForegroundColor Yellow
         $allGood = $false
+
+        $staleKeys = @(Get-TailscaleStaleFunnelKeys -DnsName $tsDnsName -LocalPort $port)
+        if ($staleKeys.Count -gt 0) {
+            Write-Host "   - 注意：舊 DNS 名稱底下有指向 localhost:$port 的殘留設定（機器改名留下的）：" -ForegroundColor Yellow
+            $staleKeys | ForEach-Object { Write-Host "     $_" -ForegroundColor White }
+            Write-Host "     它們不會服務任何流量，只能用 tailscale serve reset 清除" -ForegroundColor Gray
+        }
     }
 
     # 檢查 runner 腳本和啟動項
@@ -281,28 +397,37 @@ if ($Remove) {
 
     # 停止 Tailscale Funnel（只移除 Claude Code UI 的路徑，不影響同 port 上的其他服務）
     Write-Host "`n2. 正在停止 Tailscale Funnel..." -ForegroundColor Yellow
-    $funnelStatus = tailscale funnel status 2>$null
-    $funnelRunning = $funnelStatus | Select-String "localhost:$port"
-    if ($funnelRunning) {
-        # 從 URL 偵測實際 HTTPS port（無 port 表示 443，有 :port 則取該值）
-        $actualUrl = $funnelStatus | Where-Object { $_ -notmatch '^\s*#' } | Select-String "https://.*\.ts\.net" | Select-Object -First 1
-        $actualHttpsPort = "443"
-        if ($actualUrl -and $actualUrl.Line -match ':(\d+)\s') {
-            $actualHttpsPort = $Matches[1]
-        }
-        Write-Host "   - 偵測到 Funnel 在 HTTPS port $actualHttpsPort 上" -ForegroundColor Gray
-        # 只移除 / 路徑，保留同 port 上的其他路由
-        tailscale funnel --https=$actualHttpsPort --set-path=/ off 2>&1 | Out-Null
-        Start-Sleep -Milliseconds 500
-        $recheckStatus = tailscale funnel status 2>$null
-        $recheckRunning = $recheckStatus | Select-String "localhost:$port"
-        if (-not $recheckRunning) {
-            Write-Host "   - Funnel 已停止 ✓" -ForegroundColor Green
-        } else {
-            Write-Host "   - 警告：無法自動停止 Funnel，請手動執行 tailscale funnel --https=$actualHttpsPort --set-path=/ off" -ForegroundColor Yellow
+
+    # 用目前 DNS 名稱底下的實際設定決定要關哪個 HTTPS port——不能從 status 文字猜，
+    # 猜到的可能是舊名或別的服務的條目，關下去不是關錯對象就是什麼都沒關到。
+    $portsToStop = @(Get-TailscaleFunnelPortsForTarget -DnsName $tsDnsName -LocalPort $port)
+
+    if ($portsToStop.Count -gt 0) {
+        foreach ($stopPort in $portsToStop) {
+            Write-Host "   - 偵測到 Funnel 在 HTTPS port $stopPort 上" -ForegroundColor Gray
+            # 只移除 / 路徑，保留同 port 上的其他路由
+            tailscale funnel --https=$stopPort --set-path=/ off 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 500
+
+            if (Test-TailscaleFunnel -DnsName $tsDnsName -HttpsPort $stopPort -LocalPort $port) {
+                Write-Host "   - 警告：無法自動停止，請手動執行 tailscale funnel --https=$stopPort --set-path=/ off" -ForegroundColor Yellow
+            } else {
+                Write-Host "   - Funnel 已停止 ✓" -ForegroundColor Green
+            }
         }
     } else {
-        Write-Host "   - Funnel 未運行，跳過" -ForegroundColor Gray
+        Write-Host "   - 目前 DNS 名稱底下沒有對應的 Funnel，跳過" -ForegroundColor Gray
+    }
+
+    # 舊主機名底下的殘留設定：funnel off 對它們無效，只能整組 reset
+    $staleKeys = @(Get-TailscaleStaleFunnelKeys -DnsName $tsDnsName -LocalPort $port)
+    if ($staleKeys.Count -gt 0) {
+        Write-Host ""
+        Write-Host "   - 偵測到掛在舊 DNS 名稱底下、指向 localhost:$port 的殘留設定：" -ForegroundColor Yellow
+        $staleKeys | ForEach-Object { Write-Host "     $_" -ForegroundColor White }
+        Write-Host "     這是機器改名留下的，不會再服務任何流量，但 funnel off 也清不掉。" -ForegroundColor Gray
+        Write-Host "     要清除請執行 tailscale serve reset（會清掉本機全部 serve/funnel 設定），" -ForegroundColor Gray
+        Write-Host "     再把其他要保留的服務重新加回去。" -ForegroundColor Gray
     }
 
     # 停止佔用 port 的進程
@@ -430,25 +555,18 @@ if ($Install) {
         Write-Host "   - Tailscale HTTPS 端口：$tsHttpsPort" -ForegroundColor Gray
     }
 
+    $expectedHttpsPort = if ($tsHttpsPort) { $tsHttpsPort } else { "443" }
+    $expectedUrl = Get-TailscaleFunnelUrl -DnsName $tsDnsName -HttpsPort $expectedHttpsPort
+
     # 檢查是否已安裝且不強制
     if ((Test-Path $runnerScript) -and (Test-Path $startupShortcut) -and -not $Force) {
         # 檢查 Funnel 是否已在運行
-        $funnelStatus = tailscale funnel status 2>$null
-        $funnelRunning = $funnelStatus | Select-String "localhost:$port"
-
-        if ($funnelRunning) {
+        if (Test-TailscaleFunnel -DnsName $tsDnsName -HttpsPort $expectedHttpsPort -LocalPort $port) {
             Write-Host ""
             Write-Host "已檢測到現有安裝配置且 Funnel 運行中 ✓" -ForegroundColor Green
             Write-Host "   - Runner 腳本：$runnerScript" -ForegroundColor Gray
             Write-Host "   - 啟動捷徑：$startupShortcut" -ForegroundColor Gray
-
-            # 提取訪問 URL
-            $funnelUrl = $funnelStatus | Where-Object { $_ -notmatch '^\s*#' } | Select-String "https://.*\.ts\.net" | Select-Object -First 1
-            if ($funnelUrl) {
-                if ($funnelUrl.Line -match '(https://\S+)') {
-                    Write-Host "   - 公網 URL：$($Matches[1])" -ForegroundColor Gray
-                }
-            }
+            Write-Host "   - 公網 URL：$expectedUrl" -ForegroundColor Gray
 
             Write-Host ""
             Write-Host "如需重新配置，請使用 -Force 參數：" -ForegroundColor Yellow
@@ -497,23 +615,25 @@ if ($Install) {
     Write-Host "`n5. 正在配置 Tailscale Funnel..." -ForegroundColor Yellow
 
     # 檢查 Funnel 是否已在運行
-    $funnelStatus = tailscale funnel status 2>$null
-    $funnelRunning = $funnelStatus | Select-String "localhost:$port"
+    $funnelRunning = Test-TailscaleFunnel -DnsName $tsDnsName -HttpsPort $expectedHttpsPort -LocalPort $port
 
-    if ($funnelRunning -and $Force) {
-        Write-Host "   - 使用 -Force 參數，正在停止現有 Funnel..." -ForegroundColor Gray
-        # 從 URL 偵測實際 HTTPS port
-        $actualUrl = $funnelStatus | Where-Object { $_ -notmatch '^\s*#' } | Select-String "https://.*\.ts\.net" | Select-Object -First 1
-        $actualHttpsPort = "443"
-        if ($actualUrl -and $actualUrl.Line -match ':(\d+)\s') {
-            $actualHttpsPort = $Matches[1]
-        }
-        tailscale funnel --https=$actualHttpsPort --set-path=/ off 2>&1 | Out-Null
-        Start-Sleep -Seconds 2
-        $funnelRunning = $null  # 強制重新啟動
+    # 掛在其他 HTTPS port 上的舊設定（.env 改過 TAILSCALE_HTTPS_PORT 就會出現），要先關掉；
+    # -Force 時連目前這筆一起關掉重來。每一筆都用它自己的 port 關，不靠猜。
+    $portsToStop = @(Get-TailscaleFunnelPortsForTarget -DnsName $tsDnsName -LocalPort $port |
+                     Where-Object { $_ -ne $expectedHttpsPort })
+    if ($Force -and $funnelRunning) {
+        $portsToStop += $expectedHttpsPort
     }
 
-    if (-not $funnelRunning -or $Force) {
+    foreach ($stopPort in $portsToStop) {
+        $reason = if ($stopPort -eq $expectedHttpsPort) { "使用 -Force 參數" } else { "HTTPS port $stopPort 不是期望的 $expectedHttpsPort" }
+        Write-Host "   - $reason，正在停止 https port $stopPort 上的 Funnel..." -ForegroundColor Gray
+        tailscale funnel --https=$stopPort --set-path=/ off 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+        if ($stopPort -eq $expectedHttpsPort) { $funnelRunning = $false }
+    }
+
+    if (-not $funnelRunning) {
         Write-Host "   - 正在啟動 Funnel (localhost:$port)..." -ForegroundColor Gray
         if ($tsHttpsArg) {
             $funnelOutput = tailscale funnel --bg $tsHttpsArg http://localhost:$port 2>&1
@@ -525,16 +645,14 @@ if ($Install) {
         Start-Sleep -Seconds 3
 
         # 驗證 Funnel 狀態
-        $funnelStatus = tailscale funnel status 2>$null
-        $funnelCheck = $funnelStatus | Select-String "localhost:$port"
-
-        if ($funnelCheck) {
+        if (Test-TailscaleFunnel -DnsName $tsDnsName -HttpsPort $expectedHttpsPort -LocalPort $port) {
             Write-Host "   - Funnel 配置成功 ✓" -ForegroundColor Green
         } else {
             Write-Host "   - Funnel 配置失敗" -ForegroundColor Red
             Write-Host "   - 故障排除：" -ForegroundColor Yellow
             Write-Host "     - 檢查 Tailscale 狀態：tailscale status" -ForegroundColor White
-            Write-Host "     - 手動配置：tailscale funnel --bg http://localhost:$port" -ForegroundColor White
+            Write-Host "     - 檢查實際設定：tailscale serve status --json" -ForegroundColor White
+            Write-Host "     - 手動配置：tailscale funnel --bg $tsHttpsArg http://localhost:$port" -ForegroundColor White
             if (-not $NonInteractive) {
                 Read-Host "按 Enter 鍵結束..."
             }
@@ -544,13 +662,8 @@ if ($Install) {
         Write-Host "   - Funnel 已在運行中 ✓" -ForegroundColor Green
     }
 
-    # 提取訪問 URL
-    $funnelStatus = tailscale funnel status 2>$null
-    $funnelUrl = $funnelStatus | Where-Object { $_ -notmatch '^\s*#' } | Select-String "https://.*\.ts\.net" | Select-Object -First 1
-    $publicUrl = $null
-    if ($funnelUrl -and $funnelUrl.Line -match '(https://\S+)') {
-        $publicUrl = $Matches[1]
-    }
+    # 提取訪問 URL（直接由目前的 DNS 名稱算出來，不從 status 文字硬撈）
+    $publicUrl = $expectedUrl
 
     # 步驟 6: 創建 Runner 腳本
     Write-Host "`n6. 正在創建 Runner 腳本..." -ForegroundColor Yellow
@@ -569,6 +682,7 @@ if ($Install) {
 `$logFile = "$($logFile -replace '\\', '\\')"
 `$port = "$port"
 `$tsHttpsArg = "$tsHttpsArg"
+`$httpsPort = "$expectedHttpsPort"
 
 # Ensure we're in the project directory
 Set-Location `$repoRoot
@@ -593,8 +707,26 @@ Add-Content -Path `$logFile -Value "Server started (PID: `$(`$serverJob.Id))"
 Start-Sleep -Seconds 5
 
 # Start Tailscale Funnel (idempotent - checks if already running)
+#
+# 不能用 tailscale funnel status 的文字去比對 localhost:<port>：serve 設定以 DNS 名稱為 key，
+# 機器改名後舊名的條目會留在設定裡卻不再服務流量，status 仍會印出來，比對到就會誤判成
+# 「還在跑」而永遠不重建 Funnel。一律對目前的 DNS 名稱查設定。
 Add-Content -Path `$logFile -Value "Checking Tailscale Funnel..."
-`$funnelCheck = tailscale funnel status 2>`$null | Select-String "localhost:`$port"
+
+`$funnelCheck = `$false
+`$statusJson = tailscale status --peers=false --json 2>`$null
+if (`$statusJson) {
+    try {
+        `$dnsName = (`$statusJson | ConvertFrom-Json).Self.DNSName.TrimEnd('.')
+        `$serve = tailscale serve status --json 2>`$null | ConvertFrom-Json
+        `$key = "`${dnsName}:`$httpsPort"
+        `$funnelCheck = (`$serve.AllowFunnel.`$key -eq `$true) -and
+                       (`$serve.Web.`$key.Handlers.'/'.Proxy -eq "http://localhost:`$port")
+    } catch {
+        `$funnelCheck = `$false
+    }
+}
+
 if (-not `$funnelCheck) {
     Add-Content -Path `$logFile -Value "Starting Tailscale Funnel on port `$port..."
     if (`$tsHttpsArg) {
