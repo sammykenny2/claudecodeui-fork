@@ -79,6 +79,7 @@ $envExample = Join-Path $repoRoot ".env.example"
 $userScriptsDir = Join-Path $env:USERPROFILE "Scripts"
 $runnerScript = Join-Path $userScriptsDir "Start-ClaudeCodeUIFunnel.ps1"
 $logFile = Join-Path $userScriptsDir "claude-code-ui-funnel.log"
+$pidFile = Join-Path $userScriptsDir "claude-code-ui-funnel.pids"
 $startupFolder = [Environment]::GetFolderPath('Startup')
 $startupShortcut = Join-Path $startupFolder "Start-ClaudeCodeUIFunnel.lnk"
 
@@ -248,6 +249,100 @@ if ($tsDnsName) {
     Write-Host "   - DNS 名稱：$tsDnsName" -ForegroundColor Gray
 } else {
     Write-Host "   - 無法取得 Tailscale DNS 名稱，Funnel 狀態偵測可能不準確" -ForegroundColor Yellow
+}
+
+# === 服務進程清理 ===
+#
+# server 是用 `Start-Process cmd.exe /c "npm run server"` 起的：真正 bind port 的是 cmd 底下的
+# node，cmd 只是批次殼層。只殺「listen 在 port 上的那個 process」會把 node 幹掉、留下 cmd 停在
+# 「終止批次工作 (Y/N)?」等一個永遠等不到的答案（視窗是 hidden 的）。這個殭屍殼層不 listen 任何
+# port，對只看 port 的清理邏輯完全隱形，卻會一直抓著專案目錄當工作目錄、抓著 server.out/err 的
+# handle 不放——結果就是專案資料夾無法改名、log 檔刪不掉，而 -Remove 還印「移除完成」。
+# 所以清理一律要連殼層一起殺：優先用 runner 記下的 PID 殺整棵 tree，其次從 port 擁有者往上追到
+# 批次殼層，最後掃出已經沒有子行程的孤兒 cmd（舊版 runner 沒寫 PID 檔，只能靠這關撿回來）。
+
+# 殺掉整棵 process tree（含卡在批次提示、無法用 Stop-Process 正常收掉的父殼）
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) { return $false }
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $false }
+
+    taskkill /PID $ProcessId /T /F 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 300
+    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+# 從 port 擁有者往上追，回傳這條鏈上最外層的批次殼層 PID。實際的鏈長這樣：
+#
+#   node.exe (server/index.js)          <- 真正 listen port 的，舊邏輯只殺這隻
+#     cmd.exe /d /s /c node ...         <- npm 起腳本用的殼（注意：這層 command line 沒有 npm）
+#       node.exe (npm-cli.js run ...)
+#         cmd.exe /c npm run server     <- 要殺的就是這層，卡在 Y/N 的也是它
+#           powershell.exe (runner)     <- 停在這裡
+#
+# 規則：只往上吃 node.exe 和帶 /c 的批次 cmd.exe，碰到別的（powershell、explorer）就停。
+# 互動式 cmd.exe 的 command line 沒有 /c，所以使用者自己開的終端機不會被追上去誤殺。
+# 父行程的建立時間必須早於子行程，否則是 PID 被回收後撞名，不能認。
+function Get-ServerShellPid {
+    param([int]$ProcessId)
+
+    $topMost = $ProcessId
+    $current = $ProcessId
+
+    for ($i = 0; $i -lt 8; $i++) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
+        if (-not $proc -or -not $proc.ParentProcessId) { break }
+
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)" -ErrorAction SilentlyContinue
+        if (-not $parent) { break }
+        if ($parent.Name -notmatch '^(cmd|node)\.exe$') { break }
+        if ($parent.Name -eq 'cmd.exe' -and $parent.CommandLine -notmatch '(?i)\s/c\b') { break }
+        if ($parent.CreationDate -and $proc.CreationDate -and $parent.CreationDate -gt $proc.CreationDate) { break }
+
+        $topMost = [int]$parent.ProcessId
+        $current = $topMost
+    }
+
+    return $topMost
+}
+
+# 掃出卡在「終止批次工作 (Y/N)?」的孤兒殼層：跑著 npm 的 cmd.exe，底下卻只剩 conhost（node 已死）
+function Get-OrphanNpmShell {
+    $shells = @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'npm\s+run\s+(server|ngrok|tailscale)' })
+
+    foreach ($shell in $shells) {
+        $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($shell.ProcessId)" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'conhost.exe' })
+        if ($children.Count -eq 0) { $shell }
+    }
+}
+
+# 刪除部署檔案。這些檔案可能還被沒清乾淨的進程開著（server.out/err 是 Start-Process 的重導向
+# 目標），失敗必須講出來——原本這裡是 -ErrorAction SilentlyContinue，檔案還在卻一聲不吭。
+function Remove-DeployFile {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    if (-not (Test-Path $Path)) {
+        Write-Host "   - $Label 不存在，跳過" -ForegroundColor Gray
+        return $true
+    }
+
+    try {
+        Remove-Item $Path -Force -ErrorAction Stop
+        Write-Host "   - 已刪除 $Label ✓" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "   - 刪除 $Label 失敗：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "     檔案仍被某個進程開著，通常是上一步沒清乾淨的殼層。" -ForegroundColor Yellow
+        Write-Host "     可重跑一次 -Remove；要查出持有者請用 Sysinternals：" -ForegroundColor Yellow
+        Write-Host "     handle64.exe -nobanner `"$Path`"" -ForegroundColor White
+        return $false
+    }
 }
 
 # === 驗證操作 ===
@@ -430,45 +525,95 @@ if ($Remove) {
         Write-Host "     再把其他要保留的服務重新加回去。" -ForegroundColor Gray
     }
 
-    # 停止佔用 port 的進程
-    Write-Host "`n3. 正在停止 port $port 上的服務..." -ForegroundColor Yellow
+    # 停止服務進程（連批次殼層一起殺，理由見上方「服務進程清理」）
+    Write-Host "`n3. 正在停止服務進程..." -ForegroundColor Yellow
+    $killed = @()
+
+    # 3-1. runner 記在 PID 檔裡的殼層：直接殺整棵 tree，最可靠
+    if (Test-Path $pidFile) {
+        foreach ($line in (Get-Content $pidFile -ErrorAction SilentlyContinue)) {
+            $recordedPid = 0
+            if (-not [int]::TryParse($line.Trim(), [ref]$recordedPid)) { continue }
+
+            $proc = Get-Process -Id $recordedPid -ErrorAction SilentlyContinue
+            if (-not $proc) { continue }
+
+            Write-Host "   - 記錄在案的 $($proc.ProcessName) (PID: $recordedPid)，連同子行程一併停止" -ForegroundColor Gray
+            if (Stop-ProcessTree -ProcessId $recordedPid) {
+                $killed += $recordedPid
+                Write-Host "     已停止 ✓" -ForegroundColor Green
+            } else {
+                Write-Host "     停止失敗，請手動執行：taskkill /PID $recordedPid /T /F" -ForegroundColor Yellow
+            }
+        }
+    }
+
+    # 3-2. 仍佔用 port 的進程：往上追到批次殼層再殺整棵，避免只殺掉 node 卻留下卡住的 cmd
     $portConn = Get-NetTCPConnection -LocalPort ([int]$port) -ErrorAction SilentlyContinue |
         Where-Object { $_.State -eq 'Listen' } |
         Select-Object -First 1
     if ($portConn) {
-        $proc = Get-Process -Id $portConn.OwningProcess -ErrorAction SilentlyContinue
-        if ($proc) {
-            Write-Host "   - 發現 $($proc.ProcessName) 進程 (PID: $($proc.Id)) 佔用 port $port" -ForegroundColor Gray
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "   - 已停止 ✓" -ForegroundColor Green
+        $ownerPid = [int]$portConn.OwningProcess
+        $shellPid = Get-ServerShellPid -ProcessId $ownerPid
+        $proc = Get-Process -Id $shellPid -ErrorAction SilentlyContinue
+
+        if ($proc -and ($shellPid -notin $killed)) {
+            if ($shellPid -ne $ownerPid) {
+                Write-Host "   - port $port 由 PID $ownerPid 佔用，其批次殼層是 $($proc.ProcessName) (PID: $shellPid)" -ForegroundColor Gray
+            } else {
+                Write-Host "   - 發現 $($proc.ProcessName) 進程 (PID: $shellPid) 佔用 port $port" -ForegroundColor Gray
+            }
+            if (Stop-ProcessTree -ProcessId $shellPid) {
+                $killed += $shellPid
+                Write-Host "     已停止 ✓" -ForegroundColor Green
+            } else {
+                Write-Host "     停止失敗，請手動執行：taskkill /PID $shellPid /T /F" -ForegroundColor Yellow
+            }
         }
-    } else {
+    } elseif ($killed.Count -eq 0) {
         Write-Host "   - 未找到 port $port 上的服務" -ForegroundColor Gray
+    }
+
+    # 3-3. 孤兒殼層：node 已結束、cmd 還卡在「終止批次工作 (Y/N)?」的殘留
+    # 光看 command line 分不出是哪個 repo 起的，所以列出來讓使用者確認，不預設代殺。
+    $orphans = @(Get-OrphanNpmShell | Where-Object { [int]$_.ProcessId -notin $killed })
+    if ($orphans.Count -gt 0) {
+        Write-Host ""
+        Write-Host "   - 偵測到卡在批次提示的殘留殼層（node 已結束，cmd 還在等 Y/N）：" -ForegroundColor Yellow
+        $orphans | ForEach-Object {
+            Write-Host "     PID $($_.ProcessId)：$($_.CommandLine)" -ForegroundColor White
+        }
+        Write-Host "     它們會抓著專案目錄和 log 檔不放，導致目錄無法改名、log 刪不掉。" -ForegroundColor Gray
+
+        $killOrphans = [bool]$Force
+        if (-not $killOrphans -and -not $NonInteractive) {
+            $killOrphans = ((Read-Host "     要一併停止嗎？(Y/N)") -match '^[Yy]')
+        }
+
+        if ($killOrphans) {
+            foreach ($orphan in $orphans) {
+                $orphanPid = [int]$orphan.ProcessId
+                if (Stop-ProcessTree -ProcessId $orphanPid) {
+                    $killed += $orphanPid
+                    Write-Host "     已停止 PID $orphanPid ✓" -ForegroundColor Green
+                } else {
+                    Write-Host "     PID $orphanPid 停止失敗，請手動執行：taskkill /PID $orphanPid /T /F" -ForegroundColor Yellow
+                }
+            }
+        } else {
+            Write-Host "     已略過（確認是本專案的話，執行 taskkill /PID <PID> /T /F，或改用 -Force）" -ForegroundColor Gray
+        }
     }
 
     # 刪除腳本
     Write-Host "`n4. 正在刪除腳本..." -ForegroundColor Yellow
 
-    if (Test-Path $runnerScript) {
-        Remove-Item $runnerScript -ErrorAction SilentlyContinue
-        Write-Host "   - 已刪除 Start-ClaudeCodeUIFunnel.ps1 ✓" -ForegroundColor Green
-    } else {
-        Write-Host "   - Start-ClaudeCodeUIFunnel.ps1 不存在，跳過" -ForegroundColor Gray
-    }
-
-    if (Test-Path $logFile) {
-        Remove-Item $logFile -ErrorAction SilentlyContinue
-        Write-Host "   - 已刪除 log 檔案 ✓" -ForegroundColor Green
-    } else {
-        Write-Host "   - Log 檔案不存在，跳過" -ForegroundColor Gray
-    }
-
-    # 清理附帶 log 檔案
-    @("$logFile.server.out", "$logFile.server.err") | ForEach-Object {
-        if (Test-Path $_) {
-            Remove-Item $_ -ErrorAction SilentlyContinue
-        }
-    }
+    $removeOk = $true
+    $removeOk = (Remove-DeployFile -Path $runnerScript -Label "Start-ClaudeCodeUIFunnel.ps1") -and $removeOk
+    $removeOk = (Remove-DeployFile -Path $logFile -Label "log 檔案") -and $removeOk
+    $removeOk = (Remove-DeployFile -Path "$logFile.server.out" -Label "server stdout log") -and $removeOk
+    $removeOk = (Remove-DeployFile -Path "$logFile.server.err" -Label "server stderr log") -and $removeOk
+    $removeOk = (Remove-DeployFile -Path $pidFile -Label "PID 記錄檔") -and $removeOk
 
     # 刪除啟動項
     Write-Host "`n5. 正在刪除 Windows 啟動項..." -ForegroundColor Yellow
@@ -481,7 +626,11 @@ if ($Remove) {
     }
 
     Write-Host ""
-    Write-Host "移除完成！" -ForegroundColor Green
+    if ($removeOk) {
+        Write-Host "移除完成！" -ForegroundColor Green
+    } else {
+        Write-Host "移除未完全成功：有檔案刪不掉，請看上方訊息。" -ForegroundColor Yellow
+    }
     Write-Host ""
 
     if (-not $NonInteractive) {
@@ -680,6 +829,7 @@ if ($Install) {
 
 `$repoRoot = "$($repoRoot -replace '\\', '\\')"
 `$logFile = "$($logFile -replace '\\', '\\')"
+`$pidFile = "$($pidFile -replace '\\', '\\')"
 `$port = "$port"
 `$tsHttpsArg = "$tsHttpsArg"
 `$httpsPort = "$expectedHttpsPort"
@@ -702,6 +852,10 @@ Add-Content -Path `$logFile -Value "Starting server (npm run server)..."
     -PassThru
 
 Add-Content -Path `$logFile -Value "Server started (PID: `$(`$serverJob.Id))"
+
+# `$serverJob 是 cmd.exe 這層批次殼層，不是 node。把它記下來，-Remove 才能 taskkill /T 整棵殺掉；
+# 少了這個，node 被殺後 cmd 會卡在「終止批次工作 (Y/N)?」變成抓著 repo 目錄不放的殭屍。
+Set-Content -Path `$pidFile -Value `$serverJob.Id -Encoding ASCII
 
 # Wait for server to initialize
 Start-Sleep -Seconds 5
