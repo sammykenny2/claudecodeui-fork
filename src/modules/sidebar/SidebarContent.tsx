@@ -2,9 +2,11 @@ import { type ReactNode } from 'react';
 import { Activity, Archive, Folder, MessageSquare, RotateCcw, Search, Trash2 } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
-import { LLMProviderLogo, ScrollArea } from '@/shared/ui';
+import { Button, LLMProviderLogo, ScrollArea } from '@/shared/ui';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationSearchResults, Project, RecentConversationListItem, ReleaseInfo, SearchProgress, SidebarProjectListProps, SidebarSearchMode } from '@/shared/types';
 import { formatCompactAge, getAllSessions } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+import { useDeleteAllProjects } from '@/modules/sidebar/hooks/useDeleteAllProjects';
+import DeleteAllProjectsModal from '@/modules/sidebar/DeleteAllProjectsModal';
 import SidebarFooter from '@/modules/sidebar/SidebarFooter';
 import SidebarHeader from '@/modules/sidebar/SidebarHeader';
 import SidebarProjectList from '@/modules/sidebar/SidebarProjectList';
@@ -126,6 +128,7 @@ type SidebarContentProps = {
   onShowVersionModal: () => void;
   onShowSettings: () => void;
   projectListProps: SidebarProjectListProps;
+  onProjectDelete?: (projectId: string) => void;
   t: TFunction;
 };
 
@@ -173,6 +176,7 @@ export default function SidebarContent({
   onShowVersionModal,
   onShowSettings,
   projectListProps,
+  onProjectDelete,
   t,
 }: SidebarContentProps) {
   const showConversationSearch = searchMode === 'conversations' && searchFilter.trim().length >= 2;
@@ -183,6 +187,14 @@ export default function SidebarContent({
   const groupedArchivedSessions = groupArchivedSessionsByProject(archivedSessions);
   const visibleArchivedItemsCount = archivedProjects.length + archivedSessions.length;
   const isRenamingOnMobile = isMobile && projectListProps.activeRename !== null;
+
+  const {
+    showDeleteAllConfirmation,
+    isDeletingAll,
+    requestDeleteAll,
+    cancelDeleteAll,
+    confirmDeleteAll,
+  } = useDeleteAllProjects(projects, onProjectDelete);
 
   return (
     <div
@@ -208,6 +220,20 @@ export default function SidebarContent({
         onCollapseSidebar={onCollapseSidebar}
         t={t}
       />
+
+      {projects.length > 0 && !isLoading && (
+        <div className="flex-shrink-0 px-3 pb-1 md:px-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 w-full justify-start gap-1.5 rounded-lg px-2.5 text-xs text-muted-foreground hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/15 dark:hover:text-red-400"
+            onClick={requestDeleteAll}
+          >
+            <Trash2 className="h-3 w-3" />
+            Delete All Projects
+          </Button>
+        </div>
+      )}
 
       <ScrollArea className="flex-1 overflow-y-auto overscroll-contain md:px-1.5 md:py-2">
         {showConversationSearch ? (
@@ -695,6 +721,15 @@ export default function SidebarContent({
           onShowVersionModal={onShowVersionModal}
           onShowSettings={onShowSettings}
           t={t}
+        />
+      )}
+
+      {showDeleteAllConfirmation && (
+        <DeleteAllProjectsModal
+          projectCount={projects.length}
+          isDeleting={isDeletingAll}
+          onCancel={cancelDeleteAll}
+          onConfirm={() => { void confirmDeleteAll(); }}
         />
       )}
     </div>

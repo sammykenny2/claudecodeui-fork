@@ -12,6 +12,7 @@ import ShellConnectionOverlay from '@/modules/shell/ShellConnectionOverlay';
 import ShellEmptyState from '@/modules/shell/ShellEmptyState';
 import ShellHeader from '@/modules/shell/ShellHeader';
 import ShellMinimalView from '@/modules/shell/ShellMinimalView';
+import TerminalButtonBar from '@/modules/shell/TerminalButtonBar';
 import TerminalShortcutsPanel from '@/modules/shell/TerminalShortcutsPanel';
 
 const SHELL_RESTART_DELAY_MS = 200;
@@ -378,9 +379,8 @@ export default function Shell({
         )}
       </div>
 
-      <TerminalShortcutsPanel
-        wsRef={wsRef}
-        terminalRef={terminalRef}
+      <TerminalButtonBar
+        ws={wsRef}
         isConnected={isConnected}
       />
 
